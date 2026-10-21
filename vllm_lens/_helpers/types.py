@@ -111,41 +111,34 @@ class HookContext:
 
     Created per (hook, request) pair.  ``saved`` persists across layers
     for the same hook, so hooks can accumulate data as each layer fires.
-    ``layer_idx``, ``seq_len`` and the position/TP fields are updated by
-    the dispatcher before each call.
+    ``layer_idx``, ``seq_len``, ``position_offset`` and ``neuron_offset``
+    are updated by the dispatcher before each call.
 
-    ``site`` is the hook site that fired (``"layer"`` or ``"mlp_act"``).
-    For ``"mlp_act"`` hooks the activation slice is rank-local under
-    tensor parallelism: column ``j`` is global neuron ``neuron_offset + j``.
     ``position_offset`` is the absolute position, within the request, of the
-    first token of the current slice (0 for the first prefill chunk; later
-    chunks and decode steps are offset).
+    slice's first token: 0 on the first prefill chunk, then offset for later
+    chunks and decode steps.  ``neuron_offset`` is only non-zero for
+    ``site="mlp_act"`` hooks under tensor parallelism, where the activation
+    slice is rank-local: column ``j`` is global neuron ``neuron_offset + j``.
     """
 
     __slots__ = (
         "layer_idx",
         "seq_len",
+        "position_offset",
+        "neuron_offset",
         "saved",
         "model",
         "_prefetched",
-        "site",
-        "tp_rank",
-        "tp_size",
-        "neuron_offset",
-        "position_offset",
     )
 
     def __init__(self) -> None:
         self.layer_idx: int = 0
         self.seq_len: int = 0
+        self.position_offset: int = 0
+        self.neuron_offset: int = 0
         self.saved: dict[str, Any] = {}
         self.model: Any = None
         self._prefetched: dict[str, torch.Tensor] = {}
-        self.site: str = "layer"
-        self.tp_rank: int = 0
-        self.tp_size: int = 1
-        self.neuron_offset: int = 0
-        self.position_offset: int = 0
 
     def get_parameter(self, name: str) -> torch.Tensor:
         """Get a model parameter by name, handling TP and PP.

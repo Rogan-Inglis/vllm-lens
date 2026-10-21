@@ -202,10 +202,8 @@ The `ctx` (a `HookContext`) passed to `fn` exposes:
 | `ctx.layer_idx: int` | The layer index currently firing. |
 | `ctx.seq_len: int` | Number of tokens in this request's slice. |
 | `ctx.model` | The underlying model (for architecture-specific access). |
-| `ctx.site: str` | The site that fired: `"layer"` or `"mlp_act"`. |
 | `ctx.position_offset: int` | Absolute position, within the request, of the first token in this slice — `0` for the first prefill chunk; later chunks and decode steps are offset. |
-| `ctx.tp_rank: int`, `ctx.tp_size: int` | This worker's tensor-parallel rank and the TP world size. |
-| `ctx.neuron_offset: int` | `site="mlp_act"` only: global neuron index of column 0 of the rank-local slice (`tp_rank * intermediate_local`); `0` at TP=1. |
+| `ctx.neuron_offset: int` | `site="mlp_act"` only: global neuron index of column 0 of the rank-local slice; `0` without tensor parallelism. |
 | `ctx.get_parameter(name) -> Tensor` | Fetch a full model parameter, gathered across TP/PP ranks — e.g. `ctx.get_parameter("lm_head.weight")`. With pipeline parallelism, `prefetch_params` the name first (see below). |
 
 `fn` runs on **every** tensor-parallel rank, so it must be deterministic across ranks (seed any randomness). Note that `ctx.saved` is merged across ranks at collection, and **list** values from different ranks are concatenated — so with TP > 1, a hook that saves plain lists sees every entry duplicated `tp_size`×. Save tensors, or guard the writes to one rank (e.g. `get_tp_group().rank_in_group == 0`, as [`jacobian_lens_chat.py`](examples/jacobian_lens_chat.py) does — but keep `ctx.get_parameter` calls on all ranks: the TP gather is a collective). For HTTP transport `fn` is serialized with cloudpickle — i.e. **arbitrary code execution** on the server, so only use with trusted clients.
@@ -256,7 +254,7 @@ out = llm.generate(["Hello world"], SamplingParams(extra_args={"apply_hooks": [h
 out[0].hook_results["0"]["n123"]  # pre-ablation activations, one entry per forward step
 ```
 
-Under tensor parallelism the intermediate dimension is column-sharded: `acts` is the rank-local slice, and column `j` is global neuron `ctx.neuron_offset + j`. Hooks receive local slices (there is no cross-rank gather), so index neurons via `neuron_offset`, and key saved lists by `ctx.tp_rank` (see the TP note above). Adding `α` to neuron `n` equals adding `α · W_down[:, n]` to the residual, which a [steering vector](#steering-vectors) already does.
+Under tensor parallelism the intermediate dimension is column-sharded: `acts` is the rank-local slice, and column `j` is global neuron `ctx.neuron_offset + j`. Hooks receive local slices (there is no cross-rank gather), so index neurons via `neuron_offset`. Each rank saves a different slice, and at collection same-key lists are concatenated across ranks while other values overwrite one another, so key saved values by `ctx.neuron_offset` (e.g. `ctx.saved[f"cols_{ctx.neuron_offset}"]`). Adding `α` to neuron `n` equals adding `α · W_down[:, n]` to the residual, which a [steering vector](#steering-vectors) already does.
 
 ### Persistent hooks (Garçon-style)
 

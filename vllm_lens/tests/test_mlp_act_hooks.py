@@ -31,6 +31,22 @@ def llm_model():
     torch.cuda.empty_cache()
 
 
+@pytest.fixture(scope="module")
+def llm_model_tp2():
+    if torch.cuda.device_count() < 2:
+        pytest.skip("TP=2 requires at least 2 GPUs")
+    llm = LLM(
+        model=MODEL_NAME,
+        dtype=REFERENCE_DTYPE,
+        gpu_memory_utilization=0.3,
+        tensor_parallel_size=2,
+    )
+    yield llm
+    del llm
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
 def _generate_one(
     llm: LLM, extra_args: dict, max_tokens: int = 1, ignore_eos: bool = False
 ) -> RequestOutput:
@@ -65,7 +81,6 @@ class TestMlpActHooks:
 
         def capture(ctx, acts):
             ctx.saved.setdefault("parts", []).append(acts.detach().float().cpu())
-            ctx.saved["site"] = ctx.site
             ctx.saved["neuron_offset"] = ctx.neuron_offset
 
         params = [
@@ -84,7 +99,6 @@ class TestMlpActHooks:
 
         for prompt, out in zip(PROMPTS, outputs):
             saved = out.hook_results["0"]  # type: ignore[reportAttributeAccessIssue]
-            assert saved["site"] == "mlp_act"
             assert saved["neuron_offset"] == 0
             ref = _hf_down_proj_input(model, tokenizer, prompt)
             got = torch.cat(saved["parts"], dim=0)[: ref.shape[0]]
@@ -93,7 +107,8 @@ class TestMlpActHooks:
             scale = ref.abs().mean().item()
             assert diff < 1e-2 * scale, f"{prompt!r}: diff {diff:.3e}, ref {scale:.3e}"
 
-    def test_position_offset_across_prefill_and_decode(self, llm_model):
+    @pytest.mark.parametrize("site", ["mlp_act", "layer"])
+    def test_position_offset_across_prefill_and_decode(self, llm_model, site):
         def record(ctx, acts):
             ctx.saved.setdefault("calls", []).append(
                 (ctx.position_offset, ctx.seq_len, acts.shape[0])
@@ -101,11 +116,7 @@ class TestMlpActHooks:
 
         out = _generate_one(
             llm_model,
-            {
-                "apply_hooks": [
-                    Hook(fn=record, layer_indices=[LAYER_IDX], site="mlp_act")
-                ]
-            },
+            {"apply_hooks": [Hook(fn=record, layer_indices=[LAYER_IDX], site=site)]},
             max_tokens=4,
             ignore_eos=True,
         )
@@ -165,4 +176,71 @@ class TestMlpActHooks:
         assert torch.equal(
             observed.activations["residual_stream"],  # type: ignore[reportAttributeAccessIssue]
             base.activations["residual_stream"],  # type: ignore[reportAttributeAccessIssue]
+        )
+
+
+class TestMlpActHooksTP2:
+    def test_capture_tp2_shards_match_hf(self, llm_model_tp2, hf_model):
+        """Each rank sees its column shard; offsets tile the full width."""
+        model, tokenizer = hf_model
+
+        def capture(ctx, acts):
+            key = f"cols_{ctx.neuron_offset}"
+            ctx.saved.setdefault(key, []).append(acts.detach().float().cpu())
+
+        out = _generate_one(
+            llm_model_tp2,
+            {
+                "apply_hooks": [
+                    Hook(fn=capture, layer_indices=[LAYER_IDX], site="mlp_act")
+                ]
+            },
+        )
+        saved = out.hook_results["0"]  # type: ignore[reportAttributeAccessIssue]
+        ref = _hf_down_proj_input(model, tokenizer, PROMPT)
+        offsets = sorted(int(k.removeprefix("cols_")) for k in saved)
+        width = ref.shape[1] // 2
+        assert offsets == [0, width], offsets
+        got = torch.cat(
+            [torch.cat(saved[f"cols_{o}"], dim=0)[: ref.shape[0]] for o in offsets],
+            dim=1,
+        )
+        assert got.shape == ref.shape
+        diff = (got - ref).abs().mean().item()
+        assert diff < 1e-2 * ref.abs().mean().item()
+
+    def test_zero_ablation_tp2_on_second_rank(self, llm_model_tp2, hf_model):
+        """``neuron_offset`` lets a hook target a neuron owned by rank 1."""
+        model, _ = hf_model
+        mlp = model.model.layers[LAYER_IDX].mlp
+        neuron = mlp.down_proj.weight.shape[1] - 1 - NEURON  # in rank 1's shard
+
+        def ablate(ctx, acts, _k=neuron):
+            local = _k - ctx.neuron_offset
+            if not 0 <= local < acts.shape[1]:
+                return None
+            ctx.saved.setdefault("a_k", []).append(acts[:, local].float().cpu())
+            acts = acts.clone()
+            acts[:, local] = 0
+            return acts
+
+        base = _generate_one(llm_model_tp2, {"output_residual_stream": [LAYER_IDX]})
+        ablated = _generate_one(
+            llm_model_tp2,
+            {
+                "output_residual_stream": [LAYER_IDX],
+                "apply_hooks": [
+                    Hook(fn=ablate, layer_indices=[LAYER_IDX], site="mlp_act")
+                ],
+            },
+        )
+        n = len(base.prompt_token_ids or [])
+        base_rs = base.activations["residual_stream"][0, :n].float()  # type: ignore[reportAttributeAccessIssue]
+        ablated_rs = ablated.activations["residual_stream"][0, :n].float()  # type: ignore[reportAttributeAccessIssue]
+        a_k = torch.cat(ablated.hook_results["0"]["a_k"], dim=0)[:n]  # type: ignore[reportAttributeAccessIssue]
+        w_col = mlp.down_proj.weight[:, neuron].detach().float().cpu()
+
+        assert a_k.abs().max() > 0, "neuron is inactive on this prompt"
+        torch.testing.assert_close(
+            base_rs - ablated_rs, torch.outer(a_k, w_col), rtol=5e-2, atol=1e-3
         )

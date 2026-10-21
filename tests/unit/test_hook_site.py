@@ -1,4 +1,4 @@
-"""CPU tests for the ``Hook.site`` field and the new ``HookContext`` fields."""
+"""CPU tests for ``Hook.site`` and the ``HookContext`` offset fields."""
 
 from __future__ import annotations
 
@@ -36,8 +36,5 @@ def test_unknown_site_rejected() -> None:
 
 def test_hook_context_defaults() -> None:
     ctx = HookContext()
-    assert ctx.site == "layer"
-    assert ctx.tp_rank == 0
-    assert ctx.tp_size == 1
-    assert ctx.neuron_offset == 0
     assert ctx.position_offset == 0
+    assert ctx.neuron_offset == 0
