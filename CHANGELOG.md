@@ -1,5 +1,7 @@
 ## Unreleased
 
+- Hooks: Added `Hook(site="mlp_act")` — hooks that read and modify per-neuron MLP activations (`silu(gate) * up`, the input to `down_proj`) per request, for neuron capture and zero / mean / clamp ablation. `HookContext` gains `site`, `tp_rank`, `tp_size`, `neuron_offset` (global index of the rank-local slice under TP) and `position_offset` (absolute position of the slice's first token). The activation module is `mlp.act_fn` by default, overridable via `VLLM_LENS_MLP_ACT_PATH`; installed lazily on first use; MoE layers are unsupported. Behaviour is unchanged unless an `mlp_act` hook is registered.
+
 ## v1.3.0 (2 October 2026)
 
 - Compatibility: Pin vLLM to the GPU-validated **0.30.0** release, with V1/eager execution. Add CPU regression CI and reproducible Slurm smoke/TP/PP suites; FP32 reference parity retains the 0.01 threshold and BF16 functional checks remain. See `docs/compatibility.md` for exact environments and coverage. (#39, #41)

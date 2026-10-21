@@ -55,6 +55,8 @@ _ZSTD_COMPRESSOR = zstd.ZstdCompressor(level=1)
 
 
 _LAYER_PATH_ENV = "VLLM_LENS_LAYER_PATH"
+_MLP_ACT_PATH_ENV = "VLLM_LENS_MLP_ACT_PATH"
+_DEFAULT_MLP_ACT_PATH = "mlp.act_fn"
 
 
 class LayerDiscoveryError(RuntimeError):
@@ -220,6 +222,44 @@ def _discover_layer_modules(worker: Any) -> dict[int, torch.nn.Module]:
         )
     logger.info("vllm-lens: discovered %d decoder layer(s) via %s", len(found), source)
     return layer_map
+
+
+def _discover_mlp_act_modules(
+    layer_map: dict[int, torch.nn.Module],
+) -> dict[int, torch.nn.Module]:
+    """Map global layer index → the module whose output is the MLP activation.
+
+    The path (``VLLM_LENS_MLP_ACT_PATH``, default ``"mlp.act_fn"``) is a
+    ``get_submodule`` path relative to each decoder layer.  For vLLM's gated
+    MLPs (``Qwen2MoeMLP`` and friends) ``act_fn`` is ``SiluAndMul``, whose
+    output is ``silu(gate) * up`` — exactly the per-neuron input to
+    ``down_proj``.  Every discovered layer must resolve; MoE blocks have no
+    such module and are unsupported.
+    """
+    path = os.environ.get(_MLP_ACT_PATH_ENV, "").strip() or _DEFAULT_MLP_ACT_PATH
+    modules: dict[int, torch.nn.Module] = {}
+    missing: list[int] = []
+    for layer_idx, layer in sorted(layer_map.items()):
+        try:
+            modules[layer_idx] = layer.get_submodule(path)
+        except AttributeError:
+            missing.append(layer_idx)
+    if missing:
+        first = layer_map[missing[0]]
+        children = [name for name, _ in first.named_children()]
+        raise LayerDiscoveryError(
+            f"site='mlp_act': {path!r} does not exist on decoder layer(s) "
+            f"{missing} (layer {missing[0]} is {type(first).__name__} with "
+            f"children {children}). Set {_MLP_ACT_PATH_ENV} to the get_submodule "
+            f"path, relative to the decoder layer, of the module whose output is "
+            f"the per-neuron MLP activation. MoE layers are unsupported."
+        )
+    logger.info(
+        "vllm-lens: resolved MLP activation module %r on %d layer(s)",
+        path,
+        len(modules),
+    )
+    return modules
 
 
 def _get_total_num_layers(worker: Any) -> int:
@@ -505,7 +545,7 @@ def _hook_inner(
             """
             nonlocal modified_output
             for pos, hook in enumerate(hooks):
-                if hook.pre or not hook.has_layer(layer_idx):
+                if hook.pre or hook.site != "layer" or not hook.has_layer(layer_idx):
                     continue
                 ctxs = store.setdefault(req_id, {})
                 ctx = ctxs.get(pos)
@@ -647,7 +687,7 @@ def _pre_hook_inner(
         """Run the pre-hooks in one category list at this layer."""
         nonlocal working, modified
         for pos, hook in enumerate(hooks):
-            if not hook.pre or not hook.has_layer(layer_idx):
+            if not hook.pre or hook.site != "layer" or not hook.has_layer(layer_idx):
                 continue
             ctxs = store.setdefault(req_id, {})
             hctx = ctxs.get(pos)
@@ -735,6 +775,170 @@ def _make_pre_hook(extension: HiddenStatesExtension, layer_idx: int) -> Callable
         except Exception:
             logger.warning(
                 "vllm-lens pre-hook error on layer %d, skipping",
+                layer_idx,
+                exc_info=True,
+            )
+            return None
+
+    return hook
+
+
+def _has_mlp_act_hooks(hooks: list[Hook]) -> bool:
+    return any(hook.site == "mlp_act" for hook in hooks)
+
+
+def _batch_layout(
+    extension: HiddenStatesExtension,
+) -> tuple[Any, list[str], int, list[int], list[int] | None] | None:
+    """Per-step batch layout: ``(runner, req_ids, num_reqs, query_start_loc,
+    seq_lens)``, or ``None`` when there is nothing to hook.
+
+    Same metadata lookup as :func:`_hook_inner` (list-wrapped metadata, dict
+    of per-layer metadata, first entry with ``query_start_loc``).
+    ``seq_lens`` comes from that same entry, so it is the per-request total
+    length after this step; ``None`` if the backend does not provide it.
+    Both are converted to Python lists once per step.
+    """
+    if not is_forward_context_available():
+        return None
+    runner = extension.model_runner
+    num_reqs = runner.input_batch.num_reqs
+    if num_reqs == 0:
+        return None
+    attn_metadata = get_forward_context().attn_metadata
+    if isinstance(attn_metadata, list):
+        attn_metadata = attn_metadata[0] if attn_metadata else None
+    if attn_metadata is None:
+        return None
+    metas = (
+        attn_metadata.values() if isinstance(attn_metadata, dict) else [attn_metadata]
+    )
+    meta = next((m for m in metas if hasattr(m, "query_start_loc")), None)
+    if meta is None:
+        return None
+    qsl = getattr(meta, "query_start_loc")
+    query_start_loc = [int(x) for x in qsl[: num_reqs + 1].tolist()]
+    raw_seq_lens: Any = getattr(meta, "seq_lens", None)
+    seq_lens: list[int] | None = None
+    if raw_seq_lens is not None:
+        if isinstance(raw_seq_lens, torch.Tensor):
+            raw_seq_lens = raw_seq_lens[:num_reqs].tolist()
+        seq_lens = [int(x) for x in list(raw_seq_lens)[:num_reqs]]
+    return runner, runner.input_batch.req_ids, num_reqs, query_start_loc, seq_lens
+
+
+def _mlp_act_hook_inner(
+    extension: HiddenStatesExtension,
+    layer_idx: int,
+    output: torch.Tensor,
+) -> torch.Tensor | None:
+    """Run ``site="mlp_act"`` hooks on a layer's MLP activation output.
+
+    ``output`` is ``(total_tokens, intermediate_local)``.  Runs on every TP
+    rank (the intermediate dimension is column-sharded).  Per-request slicing
+    and context stores are shared with the layer hooks; a position holds one
+    hook with one site, so result keys stay stable.
+    """
+    persistent_hooks = extension._persistent_hooks
+    persistent_active = any(
+        h.site == "mlp_act" and h.has_layer(layer_idx) for h in persistent_hooks
+    )
+    if not persistent_active and not extension._hook_data:
+        return None
+
+    layout = _batch_layout(extension)
+    if layout is None:
+        return None
+    runner, req_ids, num_reqs, query_start_loc, seq_lens = layout
+
+    tp_rank = extension._tp_rank
+    tp_size = extension._tp_size
+    neuron_offset = tp_rank * output.shape[-1]
+    modified = False
+    working = output
+
+    def _run_category(
+        hooks: list[Hook],
+        store: dict[str, dict[int, HookContext]],
+        req_id: str,
+        start: int,
+        end: int,
+        position_offset: int,
+    ) -> None:
+        nonlocal working, modified
+        for pos, hook in enumerate(hooks):
+            if hook.site != "mlp_act" or not hook.has_layer(layer_idx):
+                continue
+            ctxs = store.setdefault(req_id, {})
+            hctx = ctxs.get(pos)
+            if hctx is None:
+                hctx = HookContext()
+                ctxs[pos] = hctx
+            hctx.layer_idx = layer_idx
+            hctx.seq_len = end - start
+            hctx.model = runner.model
+            hctx._prefetched = extension._prefetched_params
+            hctx.site = "mlp_act"
+            hctx.tp_rank = tp_rank
+            hctx.tp_size = tp_size
+            hctx.neuron_offset = neuron_offset
+            hctx.position_offset = position_offset
+
+            result = hook.fn(hctx, working[start:end])
+            if result is not None:
+                if not modified:
+                    working = output.clone()
+                    modified = True
+                working[start:end] = result
+
+    for i in range(num_reqs):
+        req_id = req_ids[i]
+        req_state = runner.requests.get(req_id)
+        extra = (
+            req_state.sampling_params.extra_args
+            if req_state and req_state.sampling_params
+            else None
+        )
+        per_req = _find_hook_configs_no_persistent(extension, req_id, extra)
+        if not persistent_active and not any(
+            h.site == "mlp_act" and h.has_layer(layer_idx) for h in per_req
+        ):
+            continue
+
+        start = query_start_loc[i]
+        end = query_start_loc[i + 1]
+        position_offset = seq_lens[i] - (end - start) if seq_lens is not None else 0
+        # Persistent hooks fire first, as in the layer path.
+        _run_category(
+            persistent_hooks,
+            extension._persistent_hook_contexts,
+            req_id,
+            start,
+            end,
+            position_offset,
+        )
+        _run_category(
+            per_req, extension._hook_contexts, req_id, start, end, position_offset
+        )
+
+    return working if modified else None
+
+
+def _make_mlp_act_hook(extension: HiddenStatesExtension, layer_idx: int) -> Callable:
+    """Create a forward hook closure for a layer's MLP activation module."""
+
+    def hook(
+        _module: torch.nn.Module,
+        _input: object,
+        output: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Forward hook: run mlp_act hooks; return the modified activations
+        (consumed by ``down_proj``) or ``None`` to leave them untouched."""
+        try:
+            return _mlp_act_hook_inner(extension, layer_idx, output)
+        except Exception:
+            logger.warning(
+                "vllm-lens mlp_act hook error on layer %d, skipping",
                 layer_idx,
                 exc_info=True,
             )
@@ -959,6 +1163,13 @@ class HiddenStatesExtension:
     # layer index (scale, sliding window, soft-cap, ... — see install_qk_hooks).
     _qk_layer_meta: dict[int, dict[str, Any]] = {}
 
+    # Decoder layers discovered by install_hooks (global index → module), and
+    # lazy site="mlp_act" install state.  TP rank/size feed HookContext.
+    _layer_map: dict[int, torch.nn.Module] = {}
+    _mlp_act_hooks_installed: bool = False
+    _tp_rank: int = 0
+    _tp_size: int = 1
+
     def install_hooks(self) -> None:
         """Register a forward hook on every decoder layer. Idempotent.
 
@@ -988,13 +1199,33 @@ class HiddenStatesExtension:
         # TP ranks after all-reduce, so the data is identical.
         tp_size = self.parallel_config.tensor_parallel_size
         self._should_capture = tp_size <= 1 or self.rank % tp_size == 0
+        self._tp_size = max(int(tp_size), 1)
+        self._tp_rank = self.rank % self._tp_size
+        self._mlp_act_hooks_installed = False
 
         # Hooks must be installed on ALL ranks so steering vectors are
         # applied everywhere (not just rank 0).
         layer_map = _discover_layer_modules(self)
+        self._layer_map = layer_map
         for layer_idx, layer in sorted(layer_map.items()):
             layer.register_forward_pre_hook(_make_pre_hook(self, layer_idx))
             layer.register_forward_hook(_make_hook(self, layer_idx))
+
+    def install_mlp_act_hooks(self) -> None:
+        """Register a forward hook on every layer's MLP activation. Idempotent.
+
+        Installed lazily, the first time a ``site="mlp_act"`` hook is
+        registered, so models without a resolvable activation module (MoE)
+        keep working for layer hooks.  Runs on **every** TP rank because the
+        intermediate dimension is column-sharded.
+        """
+        if self._mlp_act_hooks_installed:
+            return
+        self.install_hooks()
+        modules = _discover_mlp_act_modules(self._layer_map)
+        for layer_idx, module in sorted(modules.items()):
+            module.register_forward_hook(_make_mlp_act_hook(self, layer_idx))
+        self._mlp_act_hooks_installed = True
 
     # ------------------------------------------------------------------
     # Steering data management (called via collective_rpc)
@@ -1401,6 +1632,8 @@ class HiddenStatesExtension:
                     raise ValueError(
                         f"layer_index {idx} out of range [0, {num_layers})"
                     )
+        if _has_mlp_act_hooks(hooks):
+            self.install_mlp_act_hooks()
         self._hook_data[key] = hooks
 
     def get_hook_results(self, external_req_id: str) -> bytes | None:
@@ -1455,6 +1688,8 @@ class HiddenStatesExtension:
                     raise ValueError(
                         f"layer_index {idx} out of range [0, {num_layers})"
                     )
+        if _has_mlp_act_hooks(hooks):
+            self.install_mlp_act_hooks()
         self._persistent_hooks.extend(hooks)
 
     def get_all_hook_results(self) -> bytes | None:
